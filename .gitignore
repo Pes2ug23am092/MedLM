@@ -38,3 +38,10 @@ frontend/dist/
 .idea/
 *.log
 
+
+# Prompt-injection detector runtime logs
+logs/
+
+# Generated detector benchmark artifacts
+outputs/*
+!outputs/thresholds.json

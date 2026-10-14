@@ -3,9 +3,8 @@ import asyncio
 import json
 import queue
 import threading
-from pathlib import Path
 from typing import Literal, Optional, Union
-
+from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
@@ -13,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from sqlmodel import Session, select
 from sse_starlette.sse import EventSourceResponse
-
+from medinj import Detector
+from medinj.calibration import load_threshold
 from src.agents.emergency_triage import EMERGENCY_WARNING, check_emergency_triage
 from src.agents.guardrails import check_hard_rules, format_guardrail_intercept, parse_embedded_options
 from src.agents.intake_extraction import extract_intake_fields
@@ -26,6 +26,29 @@ from src.db.models import ApiUser, Conversation, ConversationMessage
 from src.db.orm import ENGINE, get_db_session, init_db
 from src.llm.client import health_sync, stream_generate
 from src.retrieval.retriever import collection, embedder, reranker, retrieve_context
+
+
+# Prompt-injection detector: shadow mode for initial evaluation.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+THRESHOLD_PATH = PROJECT_ROOT / "outputs" / "thresholds.json"
+INJECTION_LOG_PATH = PROJECT_ROOT / "logs" / "injection_decisions.jsonl"
+
+# Ensure the log directory exists in a fresh checkout.
+INJECTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+INJECTION_BACKEND = "prompt_guard_2"
+INJECTION_THRESHOLD = load_threshold(
+    str(THRESHOLD_PATH),
+    INJECTION_BACKEND,
+)
+
+injection_detector = Detector(
+    backend=INJECTION_BACKEND,
+    threshold=INJECTION_THRESHOLD,
+    shadow_mode=True,
+    log_path=str(INJECTION_LOG_PATH),
+    log_text=False,
+)
 
 app = FastAPI(title="Medical RAG & MedGemma Clinical API")
 
@@ -374,6 +397,16 @@ def _run_pipeline(req: ChatStreamRequest, conversation_id: int, sink: "queue.Que
                 sink.put({"event": "done", "data": {"status": "EMERGENCY_ESCALATION", "score": 1.0}})
                 return
 
+            # Prompt-injection detection (shadow mode: observe, do not block).
+            injection_result = injection_detector.detect(raw_input)
+
+            print(
+                "[prompt-injection] "
+                f"label={injection_result.label} "
+                f"score={injection_result.score:.6f} "
+                f"threshold={injection_result.threshold:.6f} "
+                f"latency_ms={injection_result.latency_ms:.2f}"
+            )
             # Layer 1: Adversarial Guardrail
             hit = check_hard_rules(raw_input)
             if hit:
