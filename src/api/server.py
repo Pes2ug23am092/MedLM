@@ -28,7 +28,7 @@ from src.llm.client import health_sync, stream_generate
 from src.retrieval.retriever import collection, embedder, reranker, retrieve_context
 
 
-# Prompt-injection detector: shadow mode for initial evaluation.
+# Prompt-injection detector: block high-confidence injection attempts before retrieval.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 THRESHOLD_PATH = PROJECT_ROOT / "outputs" / "thresholds.json"
 INJECTION_LOG_PATH = PROJECT_ROOT / "logs" / "injection_decisions.jsonl"
@@ -45,9 +45,14 @@ INJECTION_THRESHOLD = load_threshold(
 injection_detector = Detector(
     backend=INJECTION_BACKEND,
     threshold=INJECTION_THRESHOLD,
-    shadow_mode=True,
+    shadow_mode=False,
     log_path=str(INJECTION_LOG_PATH),
     log_text=False,
+)
+
+PROMPT_INJECTION_RESPONSE = (
+    "Sorry, this prompt seems suspicious and I cannot process it. "
+    "Please rephrase your question without instructions about changing the assistant's behavior."
 )
 
 app = FastAPI(title="Medical RAG & MedGemma Clinical API")
@@ -407,6 +412,32 @@ def _run_pipeline(req: ChatStreamRequest, conversation_id: int, sink: "queue.Que
                 f"threshold={injection_result.threshold:.6f} "
                 f"latency_ms={injection_result.latency_ms:.2f}"
             )
+
+            if injection_detector.should_block(injection_result):
+                _save_message(db, conversation_id, "user", raw_input)
+                _save_message(
+                    db,
+                    conversation_id,
+                    "assistant",
+                    PROMPT_INJECTION_RESPONSE,
+                    meta={
+                        "prompt_injection": True,
+                        "detector_score": injection_result.score,
+                    },
+                )
+                sink.put({"event": "sources", "data": []})
+                sink.put({"event": "token", "data": PROMPT_INJECTION_RESPONSE})
+                sink.put(
+                    {
+                        "event": "done",
+                        "data": {
+                            "status": "PROMPT_INJECTION_BLOCKED",
+                            "score": injection_result.score,
+                        },
+                    }
+                )
+                return
+
             # Layer 1: Adversarial Guardrail
             hit = check_hard_rules(raw_input)
             if hit:
